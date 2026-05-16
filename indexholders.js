@@ -130,24 +130,31 @@ function makeSemaphore(limit) {
 /////////////////////////////
 // CSV WRITER
 // Rewrites the full sorted CSV to disk.
-// Called after every resolved balance so the file is always current.
+// All calls are serialized through a queue so concurrent balanceOf
+// completions never produce interleaved or stale writes.
 /////////////////////////////
 
-async function writeCSV(balances) {
-    const holders = Array.from(balances.entries())
-        .map(([addr, bal]) => [addr, BigInt(bal)])
-        .sort(([addrA, balA], [addrB, balB]) => {
-            if (balB !== balA) return Number(balB - balA);
-            return addrA.localeCompare(addrB);
-        });
+let csvWriteQueue = Promise.resolve();
 
-    // Write to tmp then rename — readers always see a complete file
-    const tmp = OUTPUT_FILE + ".tmp";
-    const lines = ["address,balance", ...holders.map(([a, b]) => `${a},${b}`)];
-    fs.writeFileSync(tmp, lines.join("\n") + "\n", "utf8");
-    fs.renameSync(tmp, OUTPUT_FILE);
+function writeCSV(balances) {
+    // Chain onto the existing queue — each write waits for the previous one
+    csvWriteQueue = csvWriteQueue.then(() => {
+        const holders = Array.from(balances.entries())
+            .map(([addr, bal]) => [addr, BigInt(bal)])
+            .sort(([addrA, balA], [addrB, balB]) => {
+                if (balB !== balA) return Number(balB - balA);
+                return addrA.localeCompare(addrB);
+            });
 
-    return holders.length;
+        // Write to tmp then rename — readers always see a complete valid file
+        const tmp = OUTPUT_FILE + ".tmp";
+        const lines = ["address,balance", ...holders.map(([a, b]) => `${a},${b}`)];
+        fs.writeFileSync(tmp, lines.join("\n") + "\n", "utf8");
+        fs.renameSync(tmp, OUTPUT_FILE);
+
+        return holders.length;
+    });
+    return csvWriteQueue;
 }
 
 /////////////////////////////
