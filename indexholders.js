@@ -192,7 +192,6 @@ async function main() {
 
     // Stream CSV writes directly to disk — avoids holding all results in memory
     const writeStream = fs.createWriteStream(OUTPUT_FILE);
-    writeStream.write("address,balance\n");
 
     // Write helper that respects backpressure
     function writeLine(line) {
@@ -204,6 +203,7 @@ async function main() {
     }
 
     const holders  = [];   // kept for final sort — only addresses with bal > 0
+    const seen     = new Set(); // guards against any duplicate address in addrList
     const failed   = [];   // addresses that exhausted all retries
     let   idx      = 0;
     let   queried  = 0;
@@ -215,6 +215,12 @@ async function main() {
             if (i >= addrList.length) break;
 
             const addr = addrList[i];
+
+            // Skip if already processed (defensive — Set guarantees uniqueness
+            // but guards against any future code path that could introduce dupes)
+            if (seen.has(addr)) continue;
+            seen.add(addr);
+
             queried++;
 
             try {
@@ -224,6 +230,7 @@ async function main() {
                 );
 
                 if (bal > 0n) {
+                    // Print immediately as each result arrives
                     console.log(`${addr}  =>  ${bal.toString()}`);
                     holders.push([addr, bal]);
                 }
@@ -240,14 +247,17 @@ async function main() {
 
     /////////////////////////////
     // PHASE 3: SORT + WRITE FINAL CSV
-    // Sort highest balance first, then alphabetical.
-    // Write sorted output — stream to disk to handle 500k+ rows.
+    // Sort highest balance first, then alphabetical for ties.
+    // CSV is written only after sorting — one entry per address, no duplicates.
     /////////////////////////////
 
     holders.sort(([addrA, balA], [addrB, balB]) => {
         if (balB !== balA) return Number(balB - balA);
         return addrA.localeCompare(addrB);
     });
+
+    // Write header then sorted rows — nothing was written to the stream before this
+    writeStream.write("address,balance\n");
 
     for (const [addr, bal] of holders) {
         await writeLine(`${addr},${bal}`);
