@@ -10,7 +10,7 @@ const RPC_URL            = "https://arc-testnet.g.alchemy.com/v2/o1k50yOLGXHrczB
 const NFT_CONTRACT       = "0x9e05c6075f9e890fc515ef86091414c77036f8fa";
 const NFT_CREATION_BLOCK = 9435462;
 const BLOCK_BATCH        = 2000;
-const CONCURRENCY        = 20;   // max parallel balanceOf calls at any time
+const CONCURRENCY        = 20;
 const MAX_RETRIES        = 5;
 const RETRY_DELAY_MS     = 1000;
 
@@ -24,11 +24,15 @@ const ZERO_ADDR       = "0x0000000000000000000000000000000000000000";
 // CHECKPOINT SCHEMA
 //
 // {
-//   latestBlock : number    — target block for this run
-//   nextBlock   : number    — next batch to fetch on resume
-//   balances    : { [addr]: string }  — all resolved balances so far
+//   contract    : string    — NFT contract address (guards against wrong file)
+//   nextBlock   : number    — next block to scan on the next run
+//   balances    : { [addr]: string }  — all resolved balances (bal > 0 only)
 //   failed      : string[]  — addresses that exhausted all retries
 // }
+//
+// The checkpoint is NEVER deleted after a successful run.
+// nextBlock advances to latestBlock+1 so the next run picks up from there.
+// Re-running with a higher block range extends the existing results.
 /////////////////////////////
 
 function loadCheckpoint() {
@@ -38,15 +42,10 @@ function loadCheckpoint() {
 }
 
 function saveCheckpoint(data) {
+    // Atomic write: tmp file then rename prevents corrupt checkpoint on kill
     const tmp = CHECKPOINT_FILE + ".tmp";
     fs.writeFileSync(tmp, JSON.stringify(data), "utf8");
     fs.renameSync(tmp, CHECKPOINT_FILE);
-}
-
-function deleteCheckpoint() {
-    for (const f of [CHECKPOINT_FILE, CHECKPOINT_FILE + ".tmp"]) {
-        if (fs.existsSync(f)) fs.unlinkSync(f);
-    }
 }
 
 /////////////////////////////
@@ -72,7 +71,9 @@ async function withRetry(fn, label) {
         catch (err) {
             lastErr = err;
             const delay = RETRY_DELAY_MS * Math.pow(2, attempt - 1);
-            process.stderr.write(`\n[retry ${attempt}/${MAX_RETRIES}] ${label} — ${err.message} — waiting ${delay}ms\n`);
+            process.stderr.write(
+                `\n[retry ${attempt}/${MAX_RETRIES}] ${label} — ${err.message} — waiting ${delay}ms\n`
+            );
             await new Promise(r => setTimeout(r, delay));
         }
     }
@@ -106,9 +107,7 @@ async function getLogs(fromBlock, toBlock) {
 }
 
 /////////////////////////////
-// CONCURRENCY LIMITER
-// Ensures at most CONCURRENCY balanceOf calls are in-flight at once.
-// Callers await acquire() before starting a call, release() when done.
+// SEMAPHORE — caps concurrent balanceOf calls
 /////////////////////////////
 
 function makeSemaphore(limit) {
@@ -123,12 +122,32 @@ function makeSemaphore(limit) {
         },
         release() {
             active--;
-            if (queue.length > 0) {
-                active++;
-                queue.shift()();
-            }
+            if (queue.length > 0) { active++; queue.shift()(); }
         }
     };
+}
+
+/////////////////////////////
+// CSV WRITER
+// Rewrites the full sorted CSV to disk.
+// Called after every resolved balance so the file is always current.
+/////////////////////////////
+
+async function writeCSV(balances) {
+    const holders = Array.from(balances.entries())
+        .map(([addr, bal]) => [addr, BigInt(bal)])
+        .sort(([addrA, balA], [addrB, balB]) => {
+            if (balB !== balA) return Number(balB - balA);
+            return addrA.localeCompare(addrB);
+        });
+
+    // Write to tmp then rename — readers always see a complete file
+    const tmp = OUTPUT_FILE + ".tmp";
+    const lines = ["address,balance", ...holders.map(([a, b]) => `${a},${b}`)];
+    fs.writeFileSync(tmp, lines.join("\n") + "\n", "utf8");
+    fs.renameSync(tmp, OUTPUT_FILE);
+
+    return holders.length;
 }
 
 /////////////////////////////
@@ -143,56 +162,47 @@ async function main() {
 
     console.log(`Target block: ${latestBlock}\n`);
 
-    // Load checkpoint — discard if it's for a different target block
-    let cp = loadCheckpoint();
-    if (cp && cp.latestBlock !== latestBlock) {
-        console.log(`[checkpoint] Discarding stale checkpoint (was for block ${cp.latestBlock})`);
-        deleteCheckpoint();
-        cp = null;
+    // Load checkpoint — valid for any previous run of the same contract
+    const cp = loadCheckpoint();
+
+    // Reject checkpoint if it belongs to a different contract
+    if (cp && cp.contract && cp.contract !== NFT_CONTRACT.toLowerCase()) {
+        console.error(`[checkpoint] Contract mismatch — expected ${NFT_CONTRACT}, got ${cp.contract}. Delete .checkpoint.json manually to reset.`);
+        process.exit(1);
     }
 
-    // Restore state from checkpoint or start fresh
-    // balances: address → balance string (only addresses with bal > 0 are stored)
-    const balances = new Map(
-        cp ? Object.entries(cp.balances) : []
-    );
-    const seen   = new Set(cp ? Object.keys(cp.balances).concat(cp.failed || []) : []);
-    const failed = new Set(cp ? cp.failed || [] : []);
+    // Restore balances and seen set from checkpoint
+    const balances = new Map(cp ? Object.entries(cp.balances) : []);
+    const failed   = new Set(cp ? (cp.failed || []) : []);
+    // seen = every address we've already dispatched (resolved or failed)
+    const seen     = new Set([...balances.keys(), ...failed]);
 
+    // Resume from where the last run ended, or from the creation block
     const resumeFrom = (cp && cp.nextBlock) ? cp.nextBlock : NFT_CREATION_BLOCK;
 
     if (resumeFrom > NFT_CREATION_BLOCK) {
-        console.log(`Resuming from block ${resumeFrom} (${seen.size} addresses already processed, ${balances.size} holders found)`);
+        console.log(`Resuming from block ${resumeFrom}`);
+        console.log(`  ${balances.size} holders already found, ${seen.size} addresses already processed\n`);
     } else {
-        console.log(`Scanning from block ${NFT_CREATION_BLOCK} → ${latestBlock}`);
+        console.log(`Starting fresh scan from block ${NFT_CREATION_BLOCK}\n`);
     }
 
-    const sem = makeSemaphore(CONCURRENCY);
+    if (resumeFrom > latestBlock) {
+        console.log(`Already up to date (checkpoint nextBlock ${resumeFrom} > target ${latestBlock})`);
+        console.log(`Run without a block argument to scan to the latest block, or pass a higher block number.`);
+        process.exit(0);
+    }
 
-    // Tracks all in-flight balanceOf promises so we can await them at the end
+    const sem      = makeSemaphore(CONCURRENCY);
     const inFlight = [];
 
-    // Checkpoint flush counter — save every 100 resolved addresses
-    let resolvedSinceLastSave = 0;
-    const CHECKPOINT_EVERY = 100;
-
-    function flushCheckpoint(nextBlock) {
-        saveCheckpoint({
-            latestBlock,
-            nextBlock,
-            balances: Object.fromEntries(balances),
-            failed  : Array.from(failed)
-        });
-        resolvedSinceLastSave = 0;
-    }
-
     /////////////////////////////
-    // dispatch: called the moment a new address is extracted from a log.
-    // Fires balanceOf immediately without blocking the log scan loop.
+    // dispatch — fires balanceOf the instant an address is seen in a log.
+    // Updates balances map, rewrites CSV, and saves checkpoint immediately.
     /////////////////////////////
 
     function dispatch(addr) {
-        if (seen.has(addr)) return; // already querying or resolved
+        if (seen.has(addr)) return;
         seen.add(addr);
 
         const p = (async () => {
@@ -206,14 +216,14 @@ async function main() {
                 if (bal > 0n) {
                     balances.set(addr, bal.toString());
                     console.log(`${addr}  =>  ${bal.toString()}`);
-                }
 
-                resolvedSinceLastSave++;
+                    // Rewrite CSV immediately so it's always up to date
+                    await writeCSV(balances);
+                }
 
             } catch (err) {
                 failed.add(addr);
                 process.stderr.write(`[FAILED] ${addr}: ${err.message}\n`);
-                resolvedSinceLastSave++;
             } finally {
                 sem.release();
             }
@@ -223,81 +233,50 @@ async function main() {
     }
 
     /////////////////////////////
-    // LOG SCAN — fires balanceOf for each new address immediately
+    // LOG SCAN
+    // Saves checkpoint after every batch with the current nextBlock.
     /////////////////////////////
 
     for (let from = resumeFrom; from <= latestBlock; from += BLOCK_BATCH) {
         const to = Math.min(from + BLOCK_BATCH - 1, latestBlock);
-        process.stdout.write(`\r[scan] Logs ${from} → ${to}  (${seen.size} addresses dispatched)   `);
+        process.stdout.write(`\r[scan] Logs ${from} → ${to}  (${seen.size} dispatched, ${balances.size} holders)   `);
 
         const logs = await getLogs(from, to);
 
         for (const log of logs) {
             const fromAddr = "0x" + log.topics[1].slice(26).toLowerCase();
             const toAddr   = "0x" + log.topics[2].slice(26).toLowerCase();
-
             if (fromAddr !== ZERO_ADDR) dispatch(fromAddr);
             if (toAddr   !== ZERO_ADDR) dispatch(toAddr);
         }
 
-        // Save checkpoint after each batch — nextBlock is where we'd resume
-        // Only flush if enough have resolved to be worth writing
-        if (resolvedSinceLastSave >= CHECKPOINT_EVERY) {
-            flushCheckpoint(from + BLOCK_BATCH);
-        } else {
-            // Always update nextBlock even if we skip the full flush
-            saveCheckpoint({
-                latestBlock,
-                nextBlock: from + BLOCK_BATCH,
-                balances : Object.fromEntries(balances),
-                failed   : Array.from(failed)
-            });
-        }
+        // Save scan position after every batch
+        saveCheckpoint({
+            contract : NFT_CONTRACT.toLowerCase(),
+            nextBlock: from + BLOCK_BATCH,
+            balances : Object.fromEntries(balances),
+            failed   : Array.from(failed)
+        });
     }
 
-    console.log(`\n[scan] Complete — ${seen.size} unique addresses dispatched`);
-    console.log(`Waiting for ${inFlight.length} in-flight balanceOf calls to finish...`);
+    console.log(`\n[scan] Complete — ${seen.size} addresses dispatched`);
+    console.log(`Waiting for ${inFlight.length} in-flight balanceOf calls to settle...`);
 
-    // Wait for all outstanding balanceOf calls to complete
     await Promise.allSettled(inFlight);
 
-    /////////////////////////////
-    // SORT: highest balance first, alphabetical on ties
-    /////////////////////////////
+    // Final CSV write after all in-flight calls finish
+    const totalHolders = await writeCSV(balances);
 
-    const holders = Array.from(balances.entries())
-        .map(([addr, bal]) => [addr, BigInt(bal)])
-        .sort(([addrA, balA], [addrB, balB]) => {
-            if (balB !== balA) return Number(balB - balA);
-            return addrA.localeCompare(addrB);
-        });
+    // Save final checkpoint — nextBlock = latestBlock+1 so the next run
+    // continues from the block after where this run ended
+    saveCheckpoint({
+        contract : NFT_CONTRACT.toLowerCase(),
+        nextBlock: latestBlock + 1,
+        balances : Object.fromEntries(balances),
+        failed   : Array.from(failed)
+    });
 
-    /////////////////////////////
-    // WRITE CSV
-    /////////////////////////////
-
-    const writeStream = fs.createWriteStream(OUTPUT_FILE);
-
-    function writeLine(line) {
-        return new Promise(resolve => {
-            const ok = writeStream.write(line + "\n");
-            if (ok) resolve();
-            else writeStream.once("drain", resolve);
-        });
-    }
-
-    await writeLine("address,balance");
-    for (const [addr, bal] of holders) {
-        await writeLine(`${addr},${bal}`);
-    }
-    await new Promise(resolve => writeStream.end(resolve));
-
-    /////////////////////////////
-    // CLEANUP + SUMMARY
-    /////////////////////////////
-
-    deleteCheckpoint();
-
+    // Write failed addresses if any
     if (failed.size > 0) {
         fs.writeFileSync(
             path.resolve(__dirname, "failed.txt"),
@@ -306,10 +285,12 @@ async function main() {
     }
 
     console.log(`\n--- Summary ---`);
-    console.log(`Addresses scanned   : ${seen.size}`);
-    console.log(`Holders (bal > 0)   : ${holders.length}`);
+    console.log(`Blocks scanned      : ${resumeFrom} → ${latestBlock}`);
+    console.log(`Addresses processed : ${seen.size}`);
+    console.log(`Holders (bal > 0)   : ${totalHolders}`);
     console.log(`Failed (all retries): ${failed.size}${failed.size > 0 ? "  → see failed.txt" : ""}`);
-    console.log(`CSV saved           : ${OUTPUT_FILE}`);
+    console.log(`CSV                 : ${OUTPUT_FILE}`);
+    console.log(`Next run resumes at : block ${latestBlock + 1}`);
 }
 
 main().catch(err => {
