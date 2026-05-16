@@ -1,3 +1,6 @@
 node_modules/
 holders.csv
+failed.txt
+.checkpoint.json
+.addresses.json
 *.log
