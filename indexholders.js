@@ -30,10 +30,11 @@ function loadCheckpoint() {
     catch { return null; }
 }
 
-// Builds the checkpoint JSON string by iterating the Map directly —
-// never allocates a full copy of the balances object.
-// Uses writeFileSync (not a stream) so the file is guaranteed to exist
-// on disk before renameSync is called. Fixes ENOENT on Termux/Android.
+// Writes checkpoint by iterating the Map directly — no full object copy.
+// Uses open('w')+write+fsync+close — no tmp file, no rename.
+// This avoids the ENOENT crash on Android/Termux where renameSync fails
+// when the source .tmp file isn't visible on the filesystem yet.
+// fsync ensures bytes are on disk before returning.
 function saveCheckpoint(nextBlock, balances, failed) {
     let json = `{"contract":${JSON.stringify(NFT_CONTRACT.toLowerCase())},"nextBlock":${nextBlock},"balances":{`;
 
@@ -52,9 +53,13 @@ function saveCheckpoint(nextBlock, balances, failed) {
     }
     json += "]}";
 
-    const tmp = CHECKPOINT_FILE + ".tmp";
-    fs.writeFileSync(tmp, json, "utf8");   // synchronous — file exists before rename
-    fs.renameSync(tmp, CHECKPOINT_FILE);
+    const fd = fs.openSync(CHECKPOINT_FILE, "w");
+    try {
+        fs.writeSync(fd, json, 0, "utf8");
+        fs.fsyncSync(fd);
+    } finally {
+        fs.closeSync(fd);
+    }
 }
 
 /////////////////////////////
@@ -70,6 +75,7 @@ function saveCheckpoint(nextBlock, balances, failed) {
 let csvWriteQueue = Promise.resolve();
 
 function writeCSV(balances) {
+    // Chain onto the queue — concurrent completions never interleave
     csvWriteQueue = csvWriteQueue.then(() => {
         const sorted = Array.from(balances.entries())
             .sort(([addrA, balA], [addrB, balB]) => {
@@ -77,17 +83,20 @@ function writeCSV(balances) {
                 return addrA.localeCompare(addrB);
             });
 
-        // Build the full CSV string then write atomically via tmp+rename.
-        // At 500k holders this is ~24 MB — acceptable since we're already
-        // doing a full sort. writeFileSync ensures the file exists before rename.
+        // Build CSV string then write via open('w')+write+fsync+close.
+        // No tmp file, no rename — avoids ENOENT on Android/Termux.
         let csv = "address,balance\n";
         for (const [addr, bal] of sorted) {
             csv += `${addr},${bal}\n`;
         }
 
-        const tmp = OUTPUT_FILE + ".tmp";
-        fs.writeFileSync(tmp, csv, "utf8");
-        fs.renameSync(tmp, OUTPUT_FILE);
+        const fd = fs.openSync(OUTPUT_FILE, "w");
+        try {
+            fs.writeSync(fd, csv, 0, "utf8");
+            fs.fsyncSync(fd);
+        } finally {
+            fs.closeSync(fd);
+        }
     });
     return csvWriteQueue;
 }
