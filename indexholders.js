@@ -10,14 +10,9 @@ const RPC_URL            = "https://arc-testnet.g.alchemy.com/v2/o1k50yOLGXHrczB
 const NFT_CONTRACT       = "0x9e05c6075f9e890fc515ef86091414c77036f8fa";
 const NFT_CREATION_BLOCK = 9435462;
 const BLOCK_BATCH        = 2000;
-const CONCURRENCY        = 20;    // parallel balanceOf calls
+const CONCURRENCY        = 20;
 const MAX_RETRIES        = 5;
 const RETRY_DELAY_MS     = 1000;
-
-// How many balanceOf results to buffer before flushing CSV + checkpoint.
-// Higher = fewer flushes = less I/O. Lower = more frequent live updates.
-// At 500k holders, each flush sorts + writes ~24 MB. 500 is a good balance.
-const FLUSH_EVERY        = 500;
 
 const OUTPUT_FILE     = path.resolve(__dirname, "holders.csv");
 const CHECKPOINT_FILE = path.resolve(__dirname, ".checkpoint.json");
@@ -26,17 +21,7 @@ const TRANSFER_TOPIC  = ethers.id("Transfer(address,address,uint256)");
 const ZERO_ADDR       = "0x0000000000000000000000000000000000000000";
 
 /////////////////////////////
-// CHECKPOINT SCHEMA
-//
-// {
-//   contract  : string   — NFT contract address (guards against wrong file)
-//   nextBlock : number   — next block to scan on the next run
-//   balances  : { [addr]: number }  — resolved balances > 0, stored as Number
-//   failed    : string[] — addresses that exhausted all retries
-// }
-//
-// Checkpoint is NEVER deleted. nextBlock advances to latestBlock+1 so
-// the next run extends from where this one ended.
+// CHECKPOINT
 /////////////////////////////
 
 function loadCheckpoint() {
@@ -45,39 +30,66 @@ function loadCheckpoint() {
     catch { return null; }
 }
 
-// Checkpoint is written incrementally using a streaming JSON approach:
-// instead of JSON.stringify(entireObject) we build the file manually
-// so we never allocate a full copy of the balances map in memory.
+// Builds the checkpoint JSON string by iterating the Map directly —
+// never allocates a full copy of the balances object.
+// Uses writeFileSync (not a stream) so the file is guaranteed to exist
+// on disk before renameSync is called. Fixes ENOENT on Termux/Android.
 function saveCheckpoint(nextBlock, balances, failed) {
-    const tmp = CHECKPOINT_FILE + ".tmp";
-    const ws  = fs.createWriteStream(tmp);
-
-    ws.write(`{"contract":${JSON.stringify(NFT_CONTRACT.toLowerCase())},"nextBlock":${nextBlock},"balances":{`);
+    let json = `{"contract":${JSON.stringify(NFT_CONTRACT.toLowerCase())},"nextBlock":${nextBlock},"balances":{`;
 
     let first = true;
     for (const [addr, bal] of balances) {
-        if (!first) ws.write(",");
-        ws.write(`${JSON.stringify(addr)}:${bal}`);
+        if (!first) json += ",";
+        json += `${JSON.stringify(addr)}:${bal}`;
         first = false;
     }
 
-    ws.write(`},"failed":[`);
+    json += `},"failed":[`;
     let fi = 0;
     for (const addr of failed) {
-        if (fi++ > 0) ws.write(",");
-        ws.write(JSON.stringify(addr));
+        if (fi++ > 0) json += ",";
+        json += JSON.stringify(addr);
     }
-    ws.write("]}");
-    ws.end();
+    json += "]}";
 
-    // Wait for the stream to finish before renaming
-    return new Promise((resolve, reject) => {
-        ws.on("finish", () => {
-            try { fs.renameSync(tmp, CHECKPOINT_FILE); resolve(); }
-            catch (e) { reject(e); }
-        });
-        ws.on("error", reject);
+    const tmp = CHECKPOINT_FILE + ".tmp";
+    fs.writeFileSync(tmp, json, "utf8");   // synchronous — file exists before rename
+    fs.renameSync(tmp, CHECKPOINT_FILE);
+}
+
+/////////////////////////////
+// CSV WRITER
+//
+// Rewrites the full sorted CSV on every call.
+// Serialized via a write queue — concurrent completions never interleave.
+// Uses writeFileSync (not a stream) to avoid the ENOENT rename race on
+// Termux/Android where finish fires before the file is visible on disk.
+// Called on every resolved balance so the file is always current.
+/////////////////////////////
+
+let csvWriteQueue = Promise.resolve();
+
+function writeCSV(balances) {
+    csvWriteQueue = csvWriteQueue.then(() => {
+        const sorted = Array.from(balances.entries())
+            .sort(([addrA, balA], [addrB, balB]) => {
+                if (balB !== balA) return balB - balA;
+                return addrA.localeCompare(addrB);
+            });
+
+        // Build the full CSV string then write atomically via tmp+rename.
+        // At 500k holders this is ~24 MB — acceptable since we're already
+        // doing a full sort. writeFileSync ensures the file exists before rename.
+        let csv = "address,balance\n";
+        for (const [addr, bal] of sorted) {
+            csv += `${addr},${bal}\n`;
+        }
+
+        const tmp = OUTPUT_FILE + ".tmp";
+        fs.writeFileSync(tmp, csv, "utf8");
+        fs.renameSync(tmp, OUTPUT_FILE);
     });
+    return csvWriteQueue;
 }
 
 /////////////////////////////
@@ -160,58 +172,6 @@ function makeSemaphore(limit) {
 }
 
 /////////////////////////////
-// CSV WRITER
-//
-// Writes the full sorted CSV using a streaming approach:
-// - Sorts entries by balance desc, then address asc
-// - Streams rows directly to disk — never builds the full file in memory
-// - Uses Number for balances (safe: NFT counts fit in 53-bit integers)
-// - Serialized via a write queue so concurrent calls never interleave
-/////////////////////////////
-
-let csvWriteQueue = Promise.resolve();
-
-function writeCSV(balances) {
-    csvWriteQueue = csvWriteQueue.then(() => new Promise((resolve, reject) => {
-        // Sort: highest balance first, alphabetical on ties
-        // Balances stored as Number — sort is ~2.7x faster than BigInt
-        const sorted = Array.from(balances.entries())
-            .sort(([addrA, balA], [addrB, balB]) => {
-                if (balB !== balA) return balB - balA;
-                return addrA.localeCompare(addrB);
-            });
-
-        const tmp = OUTPUT_FILE + ".tmp";
-        const ws  = fs.createWriteStream(tmp);
-
-        ws.write("address,balance\n");
-
-        let i = 0;
-        function writeNext() {
-            let ok = true;
-            while (i < sorted.length && ok) {
-                const [addr, bal] = sorted[i++];
-                ok = ws.write(`${addr},${bal}\n`);
-            }
-            if (i < sorted.length) {
-                ws.once("drain", writeNext);
-            } else {
-                ws.end();
-            }
-        }
-
-        ws.on("finish", () => {
-            try { fs.renameSync(tmp, OUTPUT_FILE); resolve(); }
-            catch (e) { reject(e); }
-        });
-        ws.on("error", reject);
-
-        writeNext();
-    }));
-    return csvWriteQueue;
-}
-
-/////////////////////////////
 // MAIN
 /////////////////////////////
 
@@ -230,15 +190,11 @@ async function main() {
         process.exit(1);
     }
 
-    // balances: addr → Number (not BigInt — Number is sufficient for NFT counts
-    // and is 2.7x faster to sort; max safe integer is 9 quadrillion)
     const balances = new Map(
         cp ? Object.entries(cp.balances).map(([a, b]) => [a, Number(b)]) : []
     );
-    const failed   = new Set(cp ? (cp.failed || []) : []);
-    // seen tracks every address dispatched (resolved or failed) so we never
-    // re-query on resume. Rebuilt from balances + failed on load.
-    const seen     = new Set([...balances.keys(), ...failed]);
+    const failed  = new Set(cp ? (cp.failed || []) : []);
+    const seen    = new Set([...balances.keys(), ...failed]);
 
     const resumeFrom = (cp && cp.nextBlock) ? cp.nextBlock : NFT_CREATION_BLOCK;
 
@@ -257,32 +213,27 @@ async function main() {
 
     const sem = makeSemaphore(CONCURRENCY);
 
-    // pendingCount: number of dispatched balanceOf calls not yet settled.
-    // Used instead of an inFlight array — avoids holding 500k promise refs.
-    let pendingCount  = 0;
-    let resolveIdle   = null; // set when we're waiting for all pending to drain
-
-    // resolvedSinceFlush: how many balanceOf calls completed since last flush
-    let resolvedSinceFlush = 0;
-    let currentScanBlock   = resumeFrom; // updated by the scan loop
+    let pendingCount       = 0;
+    let resolveIdle        = null;
+    let currentScanBlock   = resumeFrom;
     let shuttingDown       = false;
 
-    async function flush() {
-        resolvedSinceFlush = 0;
-        await Promise.all([
-            writeCSV(balances),
-            saveCheckpoint(currentScanBlock, balances, failed)
-        ]);
+    // Flush checkpoint synchronously — called after every batch and on signal
+    function flushCheckpoint() {
+        saveCheckpoint(currentScanBlock, balances, failed);
     }
 
-    // On SIGINT (Ctrl+C) or SIGTERM: save checkpoint with everything resolved
-    // so far, then exit cleanly. Re-run will resume from currentScanBlock.
-    async function shutdown(signal) {
+    /////////////////////////////
+    // SIGINT / SIGTERM handler
+    // Saves checkpoint with all resolved balances then exits cleanly.
+    /////////////////////////////
+
+    function shutdown(signal) {
         if (shuttingDown) return;
         shuttingDown = true;
         process.stdout.write(`\n[${signal}] Saving checkpoint before exit...\n`);
         try {
-            await saveCheckpoint(currentScanBlock, balances, failed);
+            saveCheckpoint(currentScanBlock, balances, failed);
             process.stdout.write(`Checkpoint saved at block ${currentScanBlock}. Re-run to resume.\n`);
         } catch (e) {
             process.stderr.write(`Failed to save checkpoint: ${e.message}\n`);
@@ -295,7 +246,7 @@ async function main() {
 
     /////////////////////////////
     // dispatch — fires balanceOf the instant an address is seen in a log.
-    // Does NOT push to an array — uses a counter to track in-flight work.
+    // Updates CSV and checkpoint immediately on every resolved balance.
     /////////////////////////////
 
     function dispatch(addr) {
@@ -311,11 +262,13 @@ async function main() {
                     `balanceOf(${addr})`
                 );
 
-                // Store as Number — safe for NFT balances (max ~9 quadrillion)
                 const balNum = Number(bal);
                 if (balNum > 0) {
                     balances.set(addr, balNum);
                     console.log(`${addr}  =>  ${balNum}`);
+
+                    // Update CSV immediately on every new balance — real time
+                    await writeCSV(balances);
                 }
 
             } catch (err) {
@@ -324,14 +277,7 @@ async function main() {
             } finally {
                 sem.release();
                 pendingCount--;
-                resolvedSinceFlush++;
 
-                // Flush CSV + checkpoint every FLUSH_EVERY completions
-                if (!shuttingDown && resolvedSinceFlush >= FLUSH_EVERY) {
-                    await flush();
-                }
-
-                // If the scan loop is waiting for all pending to drain, signal it
                 if (pendingCount === 0 && resolveIdle) {
                     resolveIdle();
                     resolveIdle = null;
@@ -340,7 +286,6 @@ async function main() {
         })();
     }
 
-    // Returns a promise that resolves when all in-flight dispatches settle
     function waitForIdle() {
         if (pendingCount === 0) return Promise.resolve();
         return new Promise(resolve => { resolveIdle = resolve; });
@@ -352,7 +297,7 @@ async function main() {
 
     for (let from = resumeFrom; from <= latestBlock; from += BLOCK_BATCH) {
         const to = Math.min(from + BLOCK_BATCH - 1, latestBlock);
-        currentScanBlock = from + BLOCK_BATCH; // next block to resume from on crash
+        currentScanBlock = from + BLOCK_BATCH;
         process.stdout.write(`\r[scan] Logs ${from} → ${to}  (${seen.size} dispatched, ${balances.size} holders)   `);
 
         const logs = await getLogs(from, to);
@@ -364,11 +309,8 @@ async function main() {
             if (toAddr   !== ZERO_ADDR) dispatch(toAddr);
         }
 
-        // Full checkpoint after every batch — always includes latest balances
-        // so stopping the script at any point loses at most one batch of logs,
-        // never any already-resolved balances.
-        // CSV flush stays batched at FLUSH_EVERY to avoid excessive I/O.
-        await saveCheckpoint(currentScanBlock, balances, failed);
+        // Save checkpoint after every batch — includes all balances resolved so far
+        flushCheckpoint();
     }
 
     console.log(`\n[scan] Complete — ${seen.size} addresses dispatched`);
@@ -376,11 +318,9 @@ async function main() {
 
     await waitForIdle();
 
-    // Final flush — write complete sorted CSV and final checkpoint
-    await flush();
-
-    // Advance nextBlock to latestBlock+1 for the next incremental run
-    await saveCheckpoint(latestBlock + 1, balances, failed);
+    // Final CSV + checkpoint after all calls settle
+    await writeCSV(balances);
+    saveCheckpoint(latestBlock + 1, balances, failed);
 
     if (failed.size > 0) {
         fs.writeFileSync(
