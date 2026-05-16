@@ -265,6 +265,7 @@ async function main() {
     // resolvedSinceFlush: how many balanceOf calls completed since last flush
     let resolvedSinceFlush = 0;
     let currentScanBlock   = resumeFrom; // updated by the scan loop
+    let shuttingDown       = false;
 
     async function flush() {
         resolvedSinceFlush = 0;
@@ -274,13 +275,31 @@ async function main() {
         ]);
     }
 
+    // On SIGINT (Ctrl+C) or SIGTERM: save checkpoint with everything resolved
+    // so far, then exit cleanly. Re-run will resume from currentScanBlock.
+    async function shutdown(signal) {
+        if (shuttingDown) return;
+        shuttingDown = true;
+        process.stdout.write(`\n[${signal}] Saving checkpoint before exit...\n`);
+        try {
+            await saveCheckpoint(currentScanBlock, balances, failed);
+            process.stdout.write(`Checkpoint saved at block ${currentScanBlock}. Re-run to resume.\n`);
+        } catch (e) {
+            process.stderr.write(`Failed to save checkpoint: ${e.message}\n`);
+        }
+        process.exit(0);
+    }
+
+    process.on("SIGINT",  () => shutdown("SIGINT"));
+    process.on("SIGTERM", () => shutdown("SIGTERM"));
+
     /////////////////////////////
     // dispatch — fires balanceOf the instant an address is seen in a log.
     // Does NOT push to an array — uses a counter to track in-flight work.
     /////////////////////////////
 
     function dispatch(addr) {
-        if (seen.has(addr)) return;
+        if (seen.has(addr) || shuttingDown) return;
         seen.add(addr);
         pendingCount++;
 
@@ -308,7 +327,7 @@ async function main() {
                 resolvedSinceFlush++;
 
                 // Flush CSV + checkpoint every FLUSH_EVERY completions
-                if (resolvedSinceFlush >= FLUSH_EVERY) {
+                if (!shuttingDown && resolvedSinceFlush >= FLUSH_EVERY) {
                     await flush();
                 }
 
@@ -345,8 +364,10 @@ async function main() {
             if (toAddr   !== ZERO_ADDR) dispatch(toAddr);
         }
 
-        // Lightweight checkpoint after every batch — only writes nextBlock
-        // Full flush (balances + CSV) happens every FLUSH_EVERY completions
+        // Full checkpoint after every batch — always includes latest balances
+        // so stopping the script at any point loses at most one batch of logs,
+        // never any already-resolved balances.
+        // CSV flush stays batched at FLUSH_EVERY to avoid excessive I/O.
         await saveCheckpoint(currentScanBlock, balances, failed);
     }
 
