@@ -203,7 +203,16 @@ async function main() {
         cp ? Object.entries(cp.balances).map(([a, b]) => [a, Number(b)]) : []
     );
     const failed  = new Set(cp ? (cp.failed || []) : []);
-    const seen    = new Set([...balances.keys(), ...failed]);
+
+    // knownAddrs: every address already resolved in a previous run.
+    // These are skipped by dispatch (no re-query during log scan) but
+    // will be refreshed once in the refresh pass after the scan completes.
+    const knownAddrs = new Set([...balances.keys(), ...failed]);
+
+    // seen: addresses dispatched THIS run — prevents duplicate dispatch
+    // during the log scan. Does NOT include knownAddrs so the refresh
+    // pass can re-query them independently.
+    const seen = new Set();
 
     const resumeFrom = (cp && cp.nextBlock) ? cp.nextBlock : NFT_CREATION_BLOCK;
 
@@ -259,7 +268,9 @@ async function main() {
     /////////////////////////////
 
     function dispatch(addr) {
-        if (seen.has(addr) || shuttingDown) return;
+        // Skip if already dispatched this run, shutting down,
+        // or already known from a previous run (handled by refresh pass)
+        if (seen.has(addr) || knownAddrs.has(addr) || shuttingDown) return;
         seen.add(addr);
         pendingCount++;
 
@@ -322,10 +333,94 @@ async function main() {
         flushCheckpoint();
     }
 
-    console.log(`\n[scan] Complete — ${seen.size} addresses dispatched`);
+    console.log(`\n[scan] Complete — ${seen.size} new addresses dispatched`);
     console.log(`Waiting for ${pendingCount} in-flight balanceOf calls to settle...`);
 
     await waitForIdle();
+
+    /////////////////////////////
+    // REFRESH PASS
+    // Re-queries every address that was already known at startup (from the
+    // checkpoint). Runs once per run, after the log scan, so balances that
+    // changed between runs are updated. Each address is queried exactly once.
+    // - Balance increased → updated in map + CSV
+    // - Balance decreased → updated in map + CSV
+    // - Balance dropped to 0 → removed from map (removed from CSV)
+    // - Was in failed → retried; if succeeds, moved to balances
+    /////////////////////////////
+
+    if (knownAddrs.size > 0 && !shuttingDown) {
+        console.log(`\n[refresh] Re-querying ${knownAddrs.size} previously known addresses...`);
+
+        const refreshList = Array.from(knownAddrs);
+        let   refreshIdx  = 0;
+        let   refreshPending = 0;
+        let   resolveRefreshIdle = null;
+        let   updated = 0;
+        let   removed = 0;
+
+        function waitForRefreshIdle() {
+            if (refreshPending === 0) return Promise.resolve();
+            return new Promise(resolve => { resolveRefreshIdle = resolve; });
+        }
+
+        function refreshOne(addr) {
+            if (shuttingDown) return;
+            refreshPending++;
+
+            (async () => {
+                await sem.acquire();
+                try {
+                    const bal = await withRetry(
+                        () => contract.balanceOf(addr),
+                        `refresh balanceOf(${addr})`
+                    );
+
+                    const balNum   = Number(bal);
+                    const prevBal  = balances.get(addr) ?? 0;
+
+                    if (balNum === prevBal) {
+                        // No change — nothing to do
+                    } else if (balNum > 0) {
+                        balances.set(addr, balNum);
+                        failed.delete(addr);   // clear from failed if it was there
+                        console.log(`[refresh] ${addr}  ${prevBal} → ${balNum}`);
+                        updated++;
+                        await writeCSV(balances);
+                    } else {
+                        // Balance dropped to 0 — remove from holders
+                        if (balances.has(addr)) {
+                            balances.delete(addr);
+                            console.log(`[refresh] ${addr}  ${prevBal} → 0 (removed)`);
+                            removed++;
+                            await writeCSV(balances);
+                        }
+                        // Keep in failed if it was already there
+                    }
+
+                } catch (err) {
+                    // Refresh failed — keep existing balance, log warning
+                    process.stderr.write(`[refresh FAILED] ${addr}: ${err.message}\n`);
+                } finally {
+                    sem.release();
+                    refreshPending--;
+                    if (refreshPending === 0 && resolveRefreshIdle) {
+                        resolveRefreshIdle();
+                        resolveRefreshIdle = null;
+                    }
+                }
+            })();
+        }
+
+        for (const addr of refreshList) {
+            if (shuttingDown) break;
+            refreshOne(addr);
+        }
+
+        await waitForRefreshIdle();
+
+        console.log(`[refresh] Done — ${updated} updated, ${removed} removed, ${knownAddrs.size - updated - removed} unchanged`);
+    }
 
     // Final CSV + checkpoint after all calls settle
     await writeCSV(balances);
@@ -340,7 +435,8 @@ async function main() {
 
     console.log(`\n--- Summary ---`);
     console.log(`Blocks scanned      : ${resumeFrom} → ${latestBlock}`);
-    console.log(`Addresses processed : ${seen.size}`);
+    console.log(`New addresses found : ${seen.size}`);
+    console.log(`Known addresses refreshed : ${knownAddrs.size}`);
     console.log(`Holders (bal > 0)   : ${balances.size}`);
     console.log(`Failed (all retries): ${failed.size}${failed.size > 0 ? "  → see failed.txt" : ""}`);
     console.log(`CSV                 : ${OUTPUT_FILE}`);
