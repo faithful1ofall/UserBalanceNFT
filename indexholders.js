@@ -12,11 +12,10 @@ const NFT_CONTRACT = "0x9e05c6075f9e890fc515ef86091414c77036f8fa";
 
 const NFT_CREATION_BLOCK = 9435462;
 
-// Keep batches small to avoid RPC range limits
 const BLOCK_BATCH = 2000;
 
-// Concurrent ownerOf calls
-const CONCURRENCY = 10;
+// How many balanceOf calls to fire in parallel
+const CONCURRENCY = 20;
 
 const OUTPUT_FILE = path.resolve(__dirname, "holders.csv");
 
@@ -31,10 +30,7 @@ const provider = new ethers.JsonRpcProvider(RPC_URL);
 
 const contract = new ethers.Contract(
     NFT_CONTRACT,
-    [
-        "function ownerOf(uint256 tokenId) view returns (address)",
-        "function totalSupply() view returns (uint256)"
-    ],
+    ["function balanceOf(address) view returns (uint256)"],
     provider
 );
 
@@ -71,15 +67,15 @@ async function main() {
         ? Number(process.argv[2])
         : await provider.getBlockNumber();
 
-    console.log(`Scanning blocks ${NFT_CREATION_BLOCK} → ${latestBlock}`);
+    console.log(`Scanning blocks ${NFT_CREATION_BLOCK} -> ${latestBlock}`);
 
     /////////////////////////////
-    // 1. COLLECT ALL MINTED TOKEN IDs
-    //    Only mint events (from == 0x0) are used to build the token list.
-    //    This guarantees we never miss a token regardless of transfer history.
+    // 1. COLLECT ALL ADDRESSES THAT EVER TOUCHED THE CONTRACT
+    //    Both senders and receivers from every Transfer event.
+    //    This is the complete set of wallets that could hold tokens.
     /////////////////////////////
 
-    const mintedTokenIds = new Set();
+    const addresses = new Set();
 
     for (
         let from = NFT_CREATION_BLOCK;
@@ -87,70 +83,61 @@ async function main() {
         from += BLOCK_BATCH
     ) {
         const to = Math.min(from + BLOCK_BATCH - 1, latestBlock);
-        console.log(`Fetching logs ${from} → ${to}`);
+        process.stdout.write(`\rFetching logs ${from} -> ${to}   `);
 
         const logs = await getLogs(from, to);
 
         for (const log of logs) {
             const fromAddr = "0x" + log.topics[1].slice(26).toLowerCase();
+            const toAddr   = "0x" + log.topics[2].slice(26).toLowerCase();
 
-            // Only mint events
-            if (fromAddr === ZERO_ADDR) {
-                const tokenId = BigInt(log.topics[3]);
-                mintedTokenIds.add(tokenId);
-            }
+            // Exclude zero address (mint source / burn destination)
+            if (fromAddr !== ZERO_ADDR) addresses.add(fromAddr);
+            if (toAddr   !== ZERO_ADDR) addresses.add(toAddr);
         }
     }
 
-    console.log(`Total minted tokens found: ${mintedTokenIds.size}`);
+    console.log(`\nUnique addresses found: ${addresses.size}`);
 
     /////////////////////////////
-    // 2. RESOLVE CURRENT OWNER FOR EACH TOKEN via ownerOf()
-    //    ownerOf() is the ground truth — it matches what block explorers show.
-    //    balanceOf() is derived from this, so we tally from ownerOf results.
+    // 2. QUERY balanceOf() FOR EVERY ADDRESS SIMULTANEOUSLY
+    //    balanceOf() is the exact value stored on-chain -- same as ARC Scan.
+    //    Print each result immediately as it comes back.
+    //    Run CONCURRENCY workers in parallel for speed.
     /////////////////////////////
 
-    const balanceMap = new Map(); // address → count (BigInt)
+    const holders = [];
+    const addrList = Array.from(addresses);
+    let idx = 0;
 
-    const tokenList = Array.from(mintedTokenIds);
-    let index = 0;
-    let resolved = 0;
-    let burned = 0;
+    // Open CSV and write header immediately
+    const writeStream = fs.createWriteStream(OUTPUT_FILE);
+    writeStream.write("address,balance\n");
 
     async function worker() {
-        while (index < tokenList.length) {
-            const tokenId = tokenList[index++];
+        while (idx < addrList.length) {
+            const addr = addrList[idx++];
 
             try {
-                const owner = (await contract.ownerOf(tokenId)).toLowerCase();
+                const bal = await contract.balanceOf(addr);
 
-                // ownerOf reverts for burned tokens; if it returns 0x0 treat as burned
-                if (owner === ZERO_ADDR) {
-                    burned++;
-                    continue;
+                if (bal > 0n) {
+                    // Print immediately as each result arrives
+                    console.log(`${addr}  =>  ${bal.toString()}`);
+                    holders.push([addr, bal]);
                 }
-
-                balanceMap.set(owner, (balanceMap.get(owner) ?? 0n) + 1n);
-                resolved++;
-
             } catch {
-                // Token was burned (ownerOf reverts) — skip it
-                burned++;
+                // RPC error for this address -- skip
             }
         }
     }
 
-    await Promise.all(
-        Array.from({ length: CONCURRENCY }, () => worker())
-    );
-
-    console.log(`Resolved: ${resolved} tokens | Burned/invalid: ${burned}`);
+    // Fire all workers simultaneously
+    await Promise.all(Array.from({ length: CONCURRENCY }, () => worker()));
 
     /////////////////////////////
-    // 3. SORT: highest balance first, then alphabetical by address
+    // 3. SORT: highest balance first, then alphabetical
     /////////////////////////////
-
-    const holders = Array.from(balanceMap.entries());
 
     holders.sort(([addrA, balA], [addrB, balB]) => {
         if (balB !== balA) return Number(balB - balA);
@@ -158,14 +145,16 @@ async function main() {
     });
 
     /////////////////////////////
-    // 4. SAVE CSV
+    // 4. WRITE SORTED CSV
     /////////////////////////////
 
-    const csv = ["address,balance", ...holders.map(([addr, bal]) => `${addr},${bal}`)];
+    for (const [addr, bal] of holders) {
+        writeStream.write(`${addr},${bal}\n`);
+    }
 
-    fs.writeFileSync(OUTPUT_FILE, csv.join("\n") + "\n");
+    await new Promise(resolve => writeStream.end(resolve));
 
-    console.log(`Saved: ${OUTPUT_FILE}`);
+    console.log(`\nSaved: ${OUTPUT_FILE}`);
     console.log(`Total holders: ${holders.length}`);
 }
 
