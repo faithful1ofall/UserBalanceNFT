@@ -1,0 +1,13 @@
+{
+  "name": "userbalancenft",
+  "version": "1.0.0",
+  "description": "Fetch accurate NFT holder balances from ARC testnet",
+  "main": "indexholders.js",
+  "scripts": {
+    "start": "node indexholders.js",
+    "test": "node indexholders.js"
+  },
+  "dependencies": {
+    "ethers": "^6.13.0"
+  }
+}
