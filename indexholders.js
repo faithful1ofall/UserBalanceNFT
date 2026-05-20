@@ -30,12 +30,11 @@ function loadCheckpoint() {
     catch { return null; }
 }
 
-// Writes checkpoint by iterating the Map directly — no full object copy.
-// Uses open('w')+write+fsync+close — no tmp file, no rename.
-// This avoids the ENOENT crash on Android/Termux where renameSync fails
-// when the source .tmp file isn't visible on the filesystem yet.
-// fsync ensures bytes are on disk before returning.
-function saveCheckpoint(nextBlock, balances, failed) {
+// Persists balances (all queried addresses, including balance=0) and the full
+// set of addresses ever seen in Transfer logs (allAddrs). This ensures that
+// addresses which currently hold 0 tokens are not lost between runs and are
+// not re-dispatched unnecessarily on resume.
+function saveCheckpoint(nextBlock, balances, failed, allAddrs) {
     let json = `{"contract":${JSON.stringify(NFT_CONTRACT.toLowerCase())},"nextBlock":${nextBlock},"balances":{`;
 
     let first = true;
@@ -49,6 +48,13 @@ function saveCheckpoint(nextBlock, balances, failed) {
     let fi = 0;
     for (const addr of failed) {
         if (fi++ > 0) json += ",";
+        json += JSON.stringify(addr);
+    }
+
+    json += `],"allAddrs":[`;
+    let ai = 0;
+    for (const addr of allAddrs) {
+        if (ai++ > 0) json += ",";
         json += JSON.stringify(addr);
     }
     json += "]}";
@@ -65,17 +71,14 @@ function saveCheckpoint(nextBlock, balances, failed) {
 /////////////////////////////
 // CSV WRITER
 //
-// Rewrites the full sorted CSV on every call.
+// Writes every address ever seen in a Transfer log, including those with
+// balance=0. Sorted by balance descending, then address ascending.
 // Serialized via a write queue — concurrent completions never interleave.
-// Uses writeFileSync (not a stream) to avoid the ENOENT rename race on
-// Termux/Android where finish fires before the file is visible on disk.
-// Called on every resolved balance so the file is always current.
 /////////////////////////////
 
 let csvWriteQueue = Promise.resolve();
 
 function writeCSV(balances) {
-    // Chain onto the queue — concurrent completions never interleave
     csvWriteQueue = csvWriteQueue.then(() => {
         const sorted = Array.from(balances.entries())
             .sort(([addrA, balA], [addrB, balB]) => {
@@ -83,8 +86,6 @@ function writeCSV(balances) {
                 return addrA.localeCompare(addrB);
             });
 
-        // Build CSV string then write via open('w')+write+fsync+close.
-        // No tmp file, no rename — avoids ENOENT on Android/Termux.
         let csv = "address,balance\n";
         for (const [addr, bal] of sorted) {
             csv += `${addr},${bal}\n`;
@@ -199,26 +200,33 @@ async function main() {
         process.exit(1);
     }
 
+    // balances holds ALL queried addresses, including those with balance=0.
+    // This is the source of truth for the CSV and the address count.
     const balances = new Map(
         cp ? Object.entries(cp.balances).map(([a, b]) => [a, Number(b)]) : []
     );
     const failed  = new Set(cp ? (cp.failed || []) : []);
 
-    // knownAddrs: every address already resolved in a previous run.
-    // These are skipped by dispatch (no re-query during log scan) but
-    // will be refreshed once in the refresh pass after the scan completes.
-    const knownAddrs = new Set([...balances.keys(), ...failed]);
+    // allAddrs: every address ever seen in a Transfer log across all runs.
+    // Persisted in the checkpoint so zero-balance addresses are not re-dispatched.
+    // Falls back to balances+failed for checkpoints written by the old version.
+    const allAddrs = new Set(cp ? (cp.allAddrs || [...balances.keys(), ...failed]) : []);
+
+    // knownAddrs: addresses already resolved (queried) in a previous run.
+    // Built from allAddrs so zero-balance addresses are included and not
+    // re-dispatched during the log scan — they are handled by the refresh pass.
+    const knownAddrs = new Set(allAddrs);
 
     // seen: addresses dispatched THIS run — prevents duplicate dispatch
-    // during the log scan. Does NOT include knownAddrs so the refresh
-    // pass can re-query them independently.
+    // during the log scan.
     const seen = new Set();
 
     const resumeFrom = (cp && cp.nextBlock) ? cp.nextBlock : NFT_CREATION_BLOCK;
 
     if (resumeFrom > NFT_CREATION_BLOCK) {
+        const holdersAboveZero = [...balances.values()].filter(b => b > 0).length;
         console.log(`Resuming from block ${resumeFrom}`);
-        console.log(`  ${balances.size} holders already found, ${seen.size} addresses already processed\n`);
+        console.log(`  ${balances.size} addresses already queried (${holdersAboveZero} with balance > 0)\n`);
     } else {
         console.log(`Starting fresh scan from block ${NFT_CREATION_BLOCK}\n`);
     }
@@ -236,14 +244,12 @@ async function main() {
     let currentScanBlock   = resumeFrom;
     let shuttingDown       = false;
 
-    // Flush checkpoint synchronously — called after every batch and on signal
     function flushCheckpoint() {
-        saveCheckpoint(currentScanBlock, balances, failed);
+        saveCheckpoint(currentScanBlock, balances, failed, allAddrs);
     }
 
     /////////////////////////////
     // SIGINT / SIGTERM handler
-    // Saves checkpoint with all resolved balances then exits cleanly.
     /////////////////////////////
 
     function shutdown(signal) {
@@ -251,7 +257,7 @@ async function main() {
         shuttingDown = true;
         process.stdout.write(`\n[${signal}] Saving checkpoint before exit...\n`);
         try {
-            saveCheckpoint(currentScanBlock, balances, failed);
+            saveCheckpoint(currentScanBlock, balances, failed, allAddrs);
             process.stdout.write(`Checkpoint saved at block ${currentScanBlock}. Re-run to resume.\n`);
         } catch (e) {
             process.stderr.write(`Failed to save checkpoint: ${e.message}\n`);
@@ -264,14 +270,15 @@ async function main() {
 
     /////////////////////////////
     // dispatch — fires balanceOf the instant an address is seen in a log.
-    // Updates CSV and checkpoint immediately on every resolved balance.
+    // Stores ALL balances including 0 so every Transfer participant is counted.
     /////////////////////////////
 
     function dispatch(addr) {
         // Skip if already dispatched this run, shutting down,
-        // or already known from a previous run (handled by refresh pass)
+        // or already known from a previous run (handled by refresh pass).
         if (seen.has(addr) || knownAddrs.has(addr) || shuttingDown) return;
         seen.add(addr);
+        allAddrs.add(addr);
         pendingCount++;
 
         (async () => {
@@ -283,13 +290,10 @@ async function main() {
                 );
 
                 const balNum = Number(bal);
-                if (balNum > 0) {
-                    balances.set(addr, balNum);
-                    console.log(`${addr}  =>  ${balNum}`);
+                balances.set(addr, balNum);
+                console.log(`${addr}  =>  ${balNum}`);
 
-                    // Update CSV immediately on every new balance — real time
-                    await writeCSV(balances);
-                }
+                await writeCSV(balances);
 
             } catch (err) {
                 failed.add(addr);
@@ -318,7 +322,8 @@ async function main() {
     for (let from = resumeFrom; from <= latestBlock; from += BLOCK_BATCH) {
         const to = Math.min(from + BLOCK_BATCH - 1, latestBlock);
         currentScanBlock = from + BLOCK_BATCH;
-        process.stdout.write(`\r[scan] Logs ${from} → ${to}  (${seen.size} dispatched, ${balances.size} holders)   `);
+        const holdersAboveZero = [...balances.values()].filter(b => b > 0).length;
+        process.stdout.write(`\r[scan] Logs ${from} → ${to}  (${seen.size} dispatched, ${balances.size} total addrs, ${holdersAboveZero} bal>0)   `);
 
         const logs = await getLogs(from, to);
 
@@ -329,7 +334,6 @@ async function main() {
             if (toAddr   !== ZERO_ADDR) dispatch(toAddr);
         }
 
-        // Save checkpoint after every batch — includes all balances resolved so far
         flushCheckpoint();
     }
 
@@ -340,24 +344,19 @@ async function main() {
 
     /////////////////////////////
     // REFRESH PASS
-    // Re-queries every address that was already known at startup (from the
-    // checkpoint). Runs once per run, after the log scan, so balances that
-    // changed between runs are updated. Each address is queried exactly once.
-    // - Balance increased → updated in map + CSV
-    // - Balance decreased → updated in map + CSV
-    // - Balance dropped to 0 → removed from map (removed from CSV)
-    // - Was in failed → retried; if succeeds, moved to balances
+    // Re-queries every address known from a previous run (including those
+    // that had balance=0) so balances stay current. Zero-balance addresses
+    // are updated in place — never removed — so the total address count
+    // matches the on-chain Transfer log history.
     /////////////////////////////
 
     if (knownAddrs.size > 0 && !shuttingDown) {
         console.log(`\n[refresh] Re-querying ${knownAddrs.size} previously known addresses...`);
 
         const refreshList = Array.from(knownAddrs);
-        let   refreshIdx  = 0;
         let   refreshPending = 0;
         let   resolveRefreshIdle = null;
         let   updated = 0;
-        let   removed = 0;
 
         function waitForRefreshIdle() {
             if (refreshPending === 0) return Promise.resolve();
@@ -376,30 +375,18 @@ async function main() {
                         `refresh balanceOf(${addr})`
                     );
 
-                    const balNum   = Number(bal);
-                    const prevBal  = balances.get(addr) ?? 0;
+                    const balNum  = Number(bal);
+                    const prevBal = balances.get(addr) ?? -1;
 
-                    if (balNum === prevBal) {
-                        // No change — nothing to do
-                    } else if (balNum > 0) {
+                    if (balNum !== prevBal) {
                         balances.set(addr, balNum);
-                        failed.delete(addr);   // clear from failed if it was there
-                        console.log(`[refresh] ${addr}  ${prevBal} → ${balNum}`);
+                        failed.delete(addr);
+                        console.log(`[refresh] ${addr}  ${prevBal === -1 ? "?" : prevBal} → ${balNum}`);
                         updated++;
                         await writeCSV(balances);
-                    } else {
-                        // Balance dropped to 0 — remove from holders
-                        if (balances.has(addr)) {
-                            balances.delete(addr);
-                            console.log(`[refresh] ${addr}  ${prevBal} → 0 (removed)`);
-                            removed++;
-                            await writeCSV(balances);
-                        }
-                        // Keep in failed if it was already there
                     }
 
                 } catch (err) {
-                    // Refresh failed — keep existing balance, log warning
                     process.stderr.write(`[refresh FAILED] ${addr}: ${err.message}\n`);
                 } finally {
                     sem.release();
@@ -419,12 +406,12 @@ async function main() {
 
         await waitForRefreshIdle();
 
-        console.log(`[refresh] Done — ${updated} updated, ${removed} removed, ${knownAddrs.size - updated - removed} unchanged`);
+        console.log(`[refresh] Done — ${updated} updated, ${knownAddrs.size - updated} unchanged`);
     }
 
     // Final CSV + checkpoint after all calls settle
     await writeCSV(balances);
-    saveCheckpoint(latestBlock + 1, balances, failed);
+    saveCheckpoint(latestBlock + 1, balances, failed, allAddrs);
 
     if (failed.size > 0) {
         fs.writeFileSync(
@@ -433,14 +420,18 @@ async function main() {
         );
     }
 
+    const holdersAboveZero = [...balances.values()].filter(b => b > 0).length;
+
     console.log(`\n--- Summary ---`);
-    console.log(`Blocks scanned      : ${resumeFrom} → ${latestBlock}`);
-    console.log(`New addresses found : ${seen.size}`);
-    console.log(`Known addresses refreshed : ${knownAddrs.size}`);
-    console.log(`Holders (bal > 0)   : ${balances.size}`);
-    console.log(`Failed (all retries): ${failed.size}${failed.size > 0 ? "  → see failed.txt" : ""}`);
-    console.log(`CSV                 : ${OUTPUT_FILE}`);
-    console.log(`Next run resumes at : block ${latestBlock + 1}`);
+    console.log(`Blocks scanned           : ${resumeFrom} → ${latestBlock}`);
+    console.log(`New addresses dispatched : ${seen.size}`);
+    console.log(`Known addresses refreshed: ${knownAddrs.size}`);
+    console.log(`Total unique addresses   : ${balances.size}`);
+    console.log(`  — with balance > 0     : ${holdersAboveZero}`);
+    console.log(`  — with balance = 0     : ${balances.size - holdersAboveZero}`);
+    console.log(`Failed (all retries)     : ${failed.size}${failed.size > 0 ? "  → see failed.txt" : ""}`);
+    console.log(`CSV                      : ${OUTPUT_FILE}`);
+    console.log(`Next run resumes at      : block ${latestBlock + 1}`);
 }
 
 main().catch(err => {
