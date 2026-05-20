@@ -14,6 +14,12 @@ const CONCURRENCY        = 20;
 const MAX_RETRIES        = 5;
 const RETRY_DELAY_MS     = 1000;
 
+// Many RPC providers cap eth_getLogs at 1000 results per call. Some throw an
+// error when the limit is hit; others silently return exactly 1000 and drop
+// the rest. We treat hitting this limit as a signal to split the range, even
+// when no error is thrown.
+const RPC_LOG_LIMIT = 1000;
+
 const OUTPUT_FILE     = path.resolve(__dirname, "holders.csv");
 const CHECKPOINT_FILE = path.resolve(__dirname, ".checkpoint.json");
 
@@ -136,11 +142,24 @@ async function withRetry(fn, label) {
 
 /////////////////////////////
 // SAFE LOG FETCH
+//
+// Splits the block range recursively when:
+//   (a) the RPC throws (e.g. "query returned more than N results"), OR
+//   (b) the response contains exactly RPC_LOG_LIMIT entries — this is the
+//       silent-truncation case where the provider returns a capped result
+//       with HTTP 200 and no error. Without this check, addresses in the
+//       truncated tail are permanently missed.
+//
+// When a single block still hits the limit we cannot split further, so we
+// emit a warning. Switching to a provider that supports cursor-based
+// pagination (e.g. eth_getLogs with a "pageKey") is the only full fix for
+// that edge case.
 /////////////////////////////
 
 async function getLogs(fromBlock, toBlock) {
+    let logs;
     try {
-        return await withRetry(
+        logs = await withRetry(
             () => provider.getLogs({
                 address: NFT_CONTRACT,
                 fromBlock,
@@ -150,6 +169,7 @@ async function getLogs(fromBlock, toBlock) {
             `getLogs(${fromBlock}-${toBlock})`
         );
     } catch (err) {
+        // RPC threw — split and retry each half independently.
         if (fromBlock === toBlock) throw err;
         const mid = Math.floor((fromBlock + toBlock) / 2);
         const [left, right] = await Promise.all([
@@ -158,6 +178,29 @@ async function getLogs(fromBlock, toBlock) {
         ]);
         return [...left, ...right];
     }
+
+    // Silent truncation guard: if the provider returned exactly the cap
+    // without throwing, split the range and re-fetch both halves so we
+    // capture every log.
+    if (logs.length >= RPC_LOG_LIMIT && fromBlock !== toBlock) {
+        const mid = Math.floor((fromBlock + toBlock) / 2);
+        const [left, right] = await Promise.all([
+            getLogs(fromBlock, mid),
+            getLogs(mid + 1, toBlock)
+        ]);
+        return [...left, ...right];
+    }
+
+    // Single-block overflow: we cannot split further. Warn so the operator
+    // knows some logs from this block may be missing.
+    if (logs.length >= RPC_LOG_LIMIT && fromBlock === toBlock) {
+        process.stderr.write(
+            `[WARN] Block ${fromBlock} returned ${logs.length} logs (>= RPC_LOG_LIMIT=${RPC_LOG_LIMIT}). ` +
+            `Logs may be truncated — consider a provider with cursor pagination.\n`
+        );
+    }
+
+    return logs;
 }
 
 /////////////////////////////
@@ -240,7 +283,10 @@ async function main() {
     const sem = makeSemaphore(CONCURRENCY);
 
     let pendingCount       = 0;
-    let resolveIdle        = null;
+    // Use an array of resolvers so multiple concurrent waitForIdle() callers
+    // are all notified when the queue drains (previously a single slot would
+    // orphan earlier waiters, causing a hang).
+    let idleResolvers      = [];
     let currentScanBlock   = resumeFrom;
     let shuttingDown       = false;
 
@@ -302,9 +348,9 @@ async function main() {
                 sem.release();
                 pendingCount--;
 
-                if (pendingCount === 0 && resolveIdle) {
-                    resolveIdle();
-                    resolveIdle = null;
+                if (pendingCount === 0 && idleResolvers.length > 0) {
+                    const resolvers = idleResolvers.splice(0);
+                    for (const resolve of resolvers) resolve();
                 }
             }
         })();
@@ -312,7 +358,7 @@ async function main() {
 
     function waitForIdle() {
         if (pendingCount === 0) return Promise.resolve();
-        return new Promise(resolve => { resolveIdle = resolve; });
+        return new Promise(resolve => { idleResolvers.push(resolve); });
     }
 
     /////////////////////////////
@@ -321,23 +367,38 @@ async function main() {
 
     for (let from = resumeFrom; from <= latestBlock; from += BLOCK_BATCH) {
         const to = Math.min(from + BLOCK_BATCH - 1, latestBlock);
-        currentScanBlock = from + BLOCK_BATCH;
-        const holdersAboveZero = [...balances.values()].filter(b => b > 0).length;
-        process.stdout.write(`\r[scan] Logs ${from} → ${to}  (${seen.size} dispatched, ${balances.size} total addrs, ${holdersAboveZero} bal>0)   `);
 
+        // Fetch all logs for this range before advancing the checkpoint
+        // pointer. If we crash during getLogs the checkpoint still points
+        // at `from`, so the batch is retried on resume rather than skipped.
         const logs = await getLogs(from, to);
 
         for (const log of logs) {
+            // Guard against malformed logs with missing or short topics.
+            if (!log.topics[1] || log.topics[1].length !== 66 ||
+                !log.topics[2] || log.topics[2].length !== 66) {
+                process.stderr.write(`[WARN] Skipping malformed log in block ${log.blockNumber}: topics=${JSON.stringify(log.topics)}\n`);
+                continue;
+            }
             const fromAddr = "0x" + log.topics[1].slice(26).toLowerCase();
             const toAddr   = "0x" + log.topics[2].slice(26).toLowerCase();
             if (fromAddr !== ZERO_ADDR) dispatch(fromAddr);
             if (toAddr   !== ZERO_ADDR) dispatch(toAddr);
         }
 
+        // Advance checkpoint AFTER processing so a crash during getLogs
+        // does not skip this batch on the next run.
+        currentScanBlock = from + BLOCK_BATCH;
+
+        const holdersAboveZero = [...balances.values()].filter(b => b > 0).length;
+        process.stdout.write(
+            `\r[scan] Logs ${from} -> ${to}  logs=${logs.length}  dispatched=${seen.size}  resolved=${balances.size}  in-flight=${pendingCount}  bal>0=${holdersAboveZero}   `
+        );
+
         flushCheckpoint();
     }
 
-    console.log(`\n[scan] Complete — ${seen.size} new addresses dispatched`);
+    console.log(`\n[scan] Complete -- ${seen.size} new addresses dispatched`);
     console.log(`Waiting for ${pendingCount} in-flight balanceOf calls to settle...`);
 
     await waitForIdle();
@@ -355,12 +416,12 @@ async function main() {
 
         const refreshList = Array.from(knownAddrs);
         let   refreshPending = 0;
-        let   resolveRefreshIdle = null;
+        let   refreshIdleResolvers = [];
         let   updated = 0;
 
         function waitForRefreshIdle() {
             if (refreshPending === 0) return Promise.resolve();
-            return new Promise(resolve => { resolveRefreshIdle = resolve; });
+            return new Promise(resolve => { refreshIdleResolvers.push(resolve); });
         }
 
         function refreshOne(addr) {
@@ -381,7 +442,7 @@ async function main() {
                     if (balNum !== prevBal) {
                         balances.set(addr, balNum);
                         failed.delete(addr);
-                        console.log(`[refresh] ${addr}  ${prevBal === -1 ? "?" : prevBal} → ${balNum}`);
+                        console.log(`[refresh] ${addr}  ${prevBal === -1 ? "?" : prevBal} -> ${balNum}`);
                         updated++;
                         await writeCSV(balances);
                     }
@@ -391,9 +452,9 @@ async function main() {
                 } finally {
                     sem.release();
                     refreshPending--;
-                    if (refreshPending === 0 && resolveRefreshIdle) {
-                        resolveRefreshIdle();
-                        resolveRefreshIdle = null;
+                    if (refreshPending === 0 && refreshIdleResolvers.length > 0) {
+                        const resolvers = refreshIdleResolvers.splice(0);
+                        for (const resolve of resolvers) resolve();
                     }
                 }
             })();
@@ -406,7 +467,7 @@ async function main() {
 
         await waitForRefreshIdle();
 
-        console.log(`[refresh] Done — ${updated} updated, ${knownAddrs.size - updated} unchanged`);
+        console.log(`[refresh] Done -- ${updated} updated, ${knownAddrs.size - updated} unchanged`);
     }
 
     // Final CSV + checkpoint after all calls settle
@@ -423,19 +484,19 @@ async function main() {
     const holdersAboveZero = [...balances.values()].filter(b => b > 0).length;
 
     console.log(`\n--- Summary ---`);
-    console.log(`Blocks scanned           : ${resumeFrom} → ${latestBlock}`);
+    console.log(`Blocks scanned           : ${resumeFrom} -> ${latestBlock}`);
     console.log(`New addresses dispatched : ${seen.size}`);
     console.log(`Known addresses refreshed: ${knownAddrs.size}`);
     console.log(`Total unique addresses   : ${balances.size}`);
-    console.log(`  — with balance > 0     : ${holdersAboveZero}`);
-    console.log(`  — with balance = 0     : ${balances.size - holdersAboveZero}`);
-    console.log(`Failed (all retries)     : ${failed.size}${failed.size > 0 ? "  → see failed.txt" : ""}`);
+    console.log(`  -- with balance > 0    : ${holdersAboveZero}`);
+    console.log(`  -- with balance = 0    : ${balances.size - holdersAboveZero}`);
+    console.log(`Failed (all retries)     : ${failed.size}${failed.size > 0 ? "  -> see failed.txt" : ""}`);
     console.log(`CSV                      : ${OUTPUT_FILE}`);
     console.log(`Next run resumes at      : block ${latestBlock + 1}`);
 }
 
 main().catch(err => {
     console.error("\nFatal error:", err.message);
-    console.error("Progress saved — re-run to resume.");
+    console.error("Progress saved -- re-run to resume.");
     process.exit(1);
 });
