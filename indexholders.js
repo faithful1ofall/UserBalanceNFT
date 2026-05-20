@@ -390,9 +390,14 @@ async function main() {
         // does not skip this batch on the next run.
         currentScanBlock = from + BLOCK_BATCH;
 
+        // new_this_run  = unique addresses dispatched for the first time this run
+        // total_unique  = all unique addresses ever seen across all runs (allAddrs)
+        // resolved      = addresses with a confirmed balance (balances map)
+        // pending       = dispatched this run but balanceOf not yet returned
+        // bal>0         = resolved addresses with a non-zero balance
         const holdersAboveZero = [...balances.values()].filter(b => b > 0).length;
         process.stdout.write(
-            `\r[scan] Logs ${from} -> ${to}  logs=${logs.length}  dispatched=${seen.size}  resolved=${balances.size}  in-flight=${pendingCount}  bal>0=${holdersAboveZero}   `
+            `\r[scan] ${from}->${to}  logs=${logs.length}  new_this_run=${seen.size}  total_unique=${allAddrs.size}  resolved=${balances.size}  pending=${pendingCount}  bal>0=${holdersAboveZero}   `
         );
 
         flushCheckpoint();
