@@ -11,6 +11,11 @@ const NFT_CONTRACT       = "0x9e05c6075f9e890fc515ef86091414c77036f8fa";
 const NFT_CREATION_BLOCK = 9435462;
 const BLOCK_BATCH        = 10000;
 const CONCURRENCY        = 20;
+// Pause the log scan when this many balanceOf calls are queued, resume
+// when the queue drains to BACKPRESSURE_RESUME. Prevents unbounded memory
+// growth when the scan outpaces the RPC concurrency limit.
+const BACKPRESSURE_PAUSE  = 500;
+const BACKPRESSURE_RESUME = 100;
 const MAX_RETRIES        = 5;
 const RETRY_DELAY_MS     = 1000;
 
@@ -352,6 +357,11 @@ async function main() {
                     const resolvers = idleResolvers.splice(0);
                     for (const resolve of resolvers) resolve();
                 }
+
+                if (pendingCount <= BACKPRESSURE_RESUME && backpressureResolvers.length > 0) {
+                    const resolvers = backpressureResolvers.splice(0);
+                    for (const resolve of resolvers) resolve();
+                }
             }
         })();
     }
@@ -361,12 +371,30 @@ async function main() {
         return new Promise(resolve => { idleResolvers.push(resolve); });
     }
 
+    // Resolvers waiting for pendingCount to drop to BACKPRESSURE_RESUME.
+    let backpressureResolvers = [];
+
+    function waitForBackpressureRelief() {
+        if (pendingCount <= BACKPRESSURE_RESUME) return Promise.resolve();
+        return new Promise(resolve => { backpressureResolvers.push(resolve); });
+    }
+
     /////////////////////////////
     // LOG SCAN
     /////////////////////////////
 
     for (let from = resumeFrom; from <= latestBlock; from += BLOCK_BATCH) {
         const to = Math.min(from + BLOCK_BATCH - 1, latestBlock);
+
+        // Backpressure: if too many balanceOf calls are queued, pause the
+        // scan until the queue drains to BACKPRESSURE_RESUME. Prevents the
+        // pending queue from growing without bound when the scan outpaces
+        // the RPC concurrency limit.
+        if (pendingCount >= BACKPRESSURE_PAUSE) {
+            process.stdout.write(`\n[backpressure] pending=${pendingCount} >= ${BACKPRESSURE_PAUSE} — pausing scan until queue <= ${BACKPRESSURE_RESUME}...\n`);
+            await waitForBackpressureRelief();
+            process.stdout.write(`[backpressure] resumed\n`);
+        }
 
         // Fetch all logs for this range before advancing the checkpoint
         // pointer. If we crash during getLogs the checkpoint still points
