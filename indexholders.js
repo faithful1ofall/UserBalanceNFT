@@ -89,11 +89,14 @@ const provider = new ethers.JsonRpcProvider(RPC_URL);
 // RETRY WRAPPER
 /////////////////////////////
 
-async function withRetry(fn, label) {
+// skipRetry(err) — optional predicate; if it returns true the error is
+// thrown immediately without burning any retry attempts (e.g. range-too-large).
+async function withRetry(fn, label, skipRetry) {
     let lastErr;
     for (let attempt = 1; attempt <= MAX_RETRIES; attempt++) {
         try { return await fn(); }
         catch (err) {
+            if (skipRetry && skipRetry(err)) throw err;
             lastErr = err;
             const delay = RETRY_DELAY_MS * Math.pow(2, attempt - 1);
             process.stderr.write(
@@ -114,6 +117,16 @@ async function withRetry(fn, label) {
 //       truncation where the provider caps at 1000 with HTTP 200.
 /////////////////////////////
 
+// Returns true for "block range too large" errors — these will never
+// succeed at the current range regardless of retries, so split immediately.
+function isRangeTooLarge(err) {
+    const msg  = (err.message || "").toLowerCase();
+    const info = (err.info?.error?.message || err.error?.message || "").toLowerCase();
+    return msg.includes("block range")  || info.includes("block range")  ||
+           msg.includes("too many")     || info.includes("too many")     ||
+           msg.includes("10000 block")  || info.includes("10000 block");
+}
+
 async function getLogs(fromBlock, toBlock) {
     let logs;
     try {
@@ -124,10 +137,12 @@ async function getLogs(fromBlock, toBlock) {
                 toBlock,
                 topics: [TRANSFER_TOPIC]
             }),
-            `getLogs(${fromBlock}-${toBlock})`
+            `getLogs(${fromBlock}-${toBlock})`,
+            // Pass a predicate: skip retries for range-too-large errors.
+            isRangeTooLarge
         );
     } catch (err) {
-        if (fromBlock === toBlock) throw err;
+        if (fromBlock === toBlock) throw err; // can't split further
         const mid = Math.floor((fromBlock + toBlock) / 2);
         const [left, right] = await Promise.all([
             getLogs(fromBlock, mid),
