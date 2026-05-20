@@ -9,7 +9,7 @@ const { ethers } = require("ethers");
 const RPC_URL            = "https://arc-testnet.g.alchemy.com/v2/o1k50yOLGXHrczBA8KDOf";
 const NFT_CONTRACT       = "0x9e05c6075f9e890fc515ef86091414c77036f8fa";
 const NFT_CREATION_BLOCK = 9435462;
-const BLOCK_BATCH        = 10000;
+const BLOCK_BATCH        = 50000;
 const CONCURRENCY        = 20;
 // Pause the log scan when this many balanceOf calls are queued, resume
 // when the queue drains to BACKPRESSURE_RESUME. Prevents unbounded memory
@@ -418,14 +418,14 @@ async function main() {
         // does not skip this batch on the next run.
         currentScanBlock = from + BLOCK_BATCH;
 
-        // new_this_run  = unique addresses dispatched for the first time this run
-        // total_unique  = all unique addresses ever seen across all runs (allAddrs)
-        // resolved      = addresses with a confirmed balance (balances map)
-        // pending       = dispatched this run but balanceOf not yet returned
-        // bal>0         = resolved addresses with a non-zero balance
+        // unique   = every address ever seen in a Transfer log (allAddrs)
+        // resolved = confirmed balanceOf result in hand  (balances map)
+        // queued   = dispatched but balanceOf not yet returned (pendingCount)
+        // failed   = exhausted all retries
+        // Invariant: unique == resolved + queued + failed
         const holdersAboveZero = [...balances.values()].filter(b => b > 0).length;
         process.stdout.write(
-            `\r[scan] ${from}->${to}  logs=${logs.length}  new_this_run=${seen.size}  total_unique=${allAddrs.size}  resolved=${balances.size}  pending=${pendingCount}  bal>0=${holdersAboveZero}   `
+            `\r[scan] ${from}->${to}  logs=${logs.length}  unique=${allAddrs.size}  resolved=${balances.size}  queued=${pendingCount}  failed=${failed.size}  bal>0=${holdersAboveZero}   `
         );
 
         flushCheckpoint();
