@@ -9,7 +9,7 @@ const { ethers } = require("ethers");
 const RPC_URL            = "https://arc-testnet.g.alchemy.com/v2/o1k50yOLGXHrczBA8KDOf";
 const NFT_CONTRACT       = "0x9e05c6075f9e890fc515ef86091414c77036f8fa";
 const NFT_CREATION_BLOCK = 9435462;
-const BLOCK_BATCH        = 50000;
+const BLOCK_BATCH        = 10000;
 const MAX_RETRIES        = 5;
 const RETRY_DELAY_MS     = 1000;
 
